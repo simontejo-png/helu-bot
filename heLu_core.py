@@ -1,80 +1,92 @@
 ﻿import telebot
-import requests
 import json
 import os
+from openai import OpenAI
+from supabase import create_client, Client
 
-TOKEN = "8960825461:AAFuuVIdvHF1Aql1RYTRAsRWnJ5gTErqNO4"
-MEMORIA_FILE = "memoria_telegram.json"
+# --- CONFIGURACION (PON TUS CLAVES AQUI) ---
+import os
+TOKEN_TELEGRAM = os.environ.get("TOKEN_TELEGRAM")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+cliente_groq = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 SYSTEM_PROMPT = """Eres HeLu, el Director Central de Neogenesis Intelligence.
-Tu usuario es Simon.
-Eres un supervisor estrategico. 
-Reglas:
-1. Responde de forma concisa.
-2. Si Simon te pide un plan, descomponlo en tareas.
-3. Si Simon te pregunta por misiones, revisa tu archivo de misiones.
-"""
+Tu usuario es Simón. Eres un supervisor estratégico. 
+Responde de forma concisa y profesional. Recuerda lo que Simón te ha dicho antes."""
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN_TELEGRAM)
 
-def obtener_misiones():
-    if os.path.exists("misiones_helu.json"):
-        with open("misiones_helu.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-def cargar_memoria():
-    if os.path.exists(MEMORIA_FILE):
-        with open(MEMORIA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return [{"role": "system", "content": SYSTEM_PROMPT}]
-
-def guardar_memoria(historial):
-    with open(MEMORIA_FILE, "w", encoding="utf-8") as f:
-        json.dump(historial, f, ensure_ascii=False, indent=4)
-
+def guardar_mensaje(user_id, role, content):
+    try:
+        supabase.table("memoria_chat").insert({
+            "user_id": user_id,
+            "role": role,
+            "content": content
+        }).execute()
+    except Exception as e:
+        print(f"Error guardando en Supabase: {e}")
+def obtener_historial(user_id):
+    try:
+        # Hacemos la consulta
+        respuesta = supabase.table("memoria_chat")\
+            .select("role, content")\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=False)\
+            .execute()
+        
+        # Si no hay datos, devolvemos vacio
+        if not respuesta.data:
+            return []
+            
+        # Tomamos los ultimos 10 mensajes
+        historial = respuesta.data[-10:]
+        
+        mensajes = []
+        for msg in historial:
+            # Verificamos que sea un diccionario para evitar el error
+            if isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if content:
+                    mensajes.append({"role": role, "content": content})
+            
+        return mensajes
+    except Exception as e:
+        print(f"Error leyendo Supabase: {e}")
+        return []
 @bot.message_handler(func=lambda message: True)
 def responder(mensaje):
-    chat_id = mensaje.chat.id
+    user_id = mensaje.chat.id
     texto_usuario = mensaje.text
 
-    # 1. Comprobar si pide misiones (Supervisor)
-    if "mision" in texto_usuario.lower() or "tarea" in texto_usuario.lower():
-        misiones = obtener_misiones()
-        if misiones:
-            respuesta = "📋 *Misiones Pendientes:*\n"
-            for m in misiones:
-                respuesta += f"\n*Objetivo:* {m.get('objetivo', 'Sin titulo')}\n"
-                for t in m.get('plan', []):
-                    respuesta += f"  • {t.get('tarea', 'Tarea')} [{t.get('estado', 'Pendiente')}]\n"
-            bot.reply_to(mensaje, respuesta, parse_mode='Markdown')
-        else:
-            bot.reply_to(mensaje, "No hay misiones registradas aun.")
-        return
+    # 1. Guardar lo que dijo el usuario en la nube
+    guardar_mensaje(user_id, "user", texto_usuario)
 
-    # 2. Si es una conversacion normal, usar Ollama
-    historial = cargar_memoria()
-    historial.append({"role": "user", "content": texto_usuario})
+    # 2. Obtener la memoria de la nube
+    historial = obtener_historial(user_id)
+    
+    # 3. Armar el contexto para Groq
+    mensajes_groq = [{"role": "system", "content": SYSTEM_PROMPT}] + historial
 
-    datos = {
-        "model": "qwen2.5:3b",
-        "messages": historial[-6:],
-        "stream": False
-    }
-
-    bot.send_chat_action(chat_id, 'typing')
+    bot.send_chat_action(user_id, 'typing')
 
     try:
-        respuesta = requests.post("http://localhost:11434/api/chat", json=datos)
-        respuesta_texto = respuesta.json()['message']['content']
+        respuesta_ia = cliente_groq.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=mensajes_groq
+        ).choices[0].message.content
         
-        historial.append({"role": "assistant", "content": respuesta_texto})
-        guardar_memoria(historial)
+        # 4. Guardar la respuesta de HeLu en la nube
+        guardar_mensaje(user_id, "assistant", respuesta_ia)
         
-        bot.reply_to(mensaje, respuesta_texto)
+        bot.reply_to(mensaje, respuesta_ia)
         
     except Exception as e:
-        bot.reply_to(mensaje, f"Error: {e}")
+        bot.reply_to(mensaje, f"Error en Groq: {e}")
 
-print("🤖 HeLu Core (Supervisor) encendido en Telegram...")
+print("🤖 HeLu (Memoria en Supabase) encendido...")
 bot.infinity_polling()
